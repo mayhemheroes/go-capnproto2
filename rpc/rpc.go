@@ -207,6 +207,7 @@ func (c *Conn) Bootstrap(ctx context.Context) (bc capnp.Client) {
 	if !c.startTask() {
 		return capnp.ErrorClient(rpcerr.Disconnectedf("connection closed"))
 	}
+	defer c.tasks.Done()
 
 	bootCtx, cancel := context.WithCancel(ctx)
 	q := c.newQuestion(capnp.Method{})
@@ -223,8 +224,6 @@ func (c *Conn) Bootstrap(ctx context.Context) (bc capnp.Client) {
 		return err
 
 	}, func(err error) {
-		defer c.tasks.Done()
-
 		if err != nil {
 			syncutil.With(&c.mu, func() {
 				c.questions[q.id] = nil
@@ -399,7 +398,13 @@ func (c *Conn) releaseAnswers(answers map[answerID]*answer) {
 
 func (c *Conn) releaseQuestions(questions []*question) {
 	for _, q := range questions {
-		q.Reject(ExcClosed)
+		canceled := q != nil && q.flags&finished != 0
+		if !canceled {
+			// Only reject the question if it isn't already flagged
+			// as finished; otherwise it was rejected when the finished
+			// flag was set.
+			q.Reject(ExcClosed)
+		}
 	}
 }
 
@@ -1460,15 +1465,20 @@ func (c *Conn) startTask() (ok bool) {
 // The caller MUST hold c.mu.  The callback will be called without
 // holding c.mu.  Callers of sendMessage MAY wish to reacquire the
 // c.mu within the callback.
-func (c *Conn) sendMessage(ctx context.Context, f func(rpccp.Message) error, callback func(error)) error {
+func (c *Conn) sendMessage(ctx context.Context, f func(rpccp.Message) error, callback func(error)) {
 	msg, send, release, err := c.transport.NewMessage(ctx)
-	if err != nil {
-		return rpcerr.Failedf("create message: %w", err)
-	}
 
-	if err = f(msg); err != nil {
-		release()
-		return rpcerr.Failedf("build message: %w", err)
+	// If errors happen when allocating or building the message, set up dummy send/release
+	// functions so the error handling logic in callback() runs as normal:
+	if err != nil {
+		release = func() {}
+		send = func() error {
+			return rpcerr.Failedf("create message: %w", err)
+		}
+	} else if err = f(msg); err != nil {
+		send = func() error {
+			return rpcerr.Failedf("build message: %w", err)
+		}
 	}
 
 	c.sender.Send(asyncSend{
@@ -1476,8 +1486,6 @@ func (c *Conn) sendMessage(ctx context.Context, f func(rpccp.Message) error, cal
 		send:     send,
 		callback: callback,
 	})
-
-	return nil
 }
 
 type asyncSend struct {
