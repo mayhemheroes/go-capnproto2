@@ -1,0 +1,4 @@
+project: go-capnproto2
+target: go-capnproto2-packed-fuzz
+cmds:
+  - cmd: ./packed-fuzz.libfuzzer
